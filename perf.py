@@ -208,7 +208,7 @@ def draw_dashboard(stdscr):
 
             SQL_TOP_20 = f"""
             SELECT
-                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, 'NEIN') || '|' || NVL(prof.has_pf, 'NEIN') || '|' || NVL(pq.dop, '---') || '|' || SUBSTR(REPLACE(q.sql_text, CHR(10), ' '), 1, 60)
+                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, '---') || '|' || NVL(prof.has_pf, '---') || '|' || NVL(pq.dop, '---') || '|' || q.sql_text
             FROM (
                 SELECT
                     sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text, exact_matching_signature, sql_profile,
@@ -296,7 +296,7 @@ def draw_dashboard(stdscr):
 
                 if current_cursor_sql_id:
                     SQL_SESS_DETAIL = f"""
-                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,25) || '|' || NVL(b.blocker_status, 'NO_BLOCK')
+                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,20) || '|' || NVL(b.blocker_status, '---')
                     FROM v$session s
                     LEFT JOIN (
                         SELECT DISTINCT blocking_session, 'BLOCKER' as blocker_status FROM v$session WHERE blocking_session IS NOT NULL
@@ -685,7 +685,7 @@ def draw_dashboard(stdscr):
                         detail_focus = "SQL_TEXT"
                         sql_scroll_top = 0
                         xplan_scroll_top = 0
-                        countdown = 0
+                        countdown = -1  # Force immediate fetch
                         refresh_frozen = False
 
             elif key in [ord("s"), curses.KEY_LEFT]:
