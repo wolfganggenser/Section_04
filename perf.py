@@ -163,7 +163,8 @@ def draw_dashboard(stdscr):
 
             SQL_TOP_20 = f"""
             SELECT
-                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec ||[...]
+                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || 
+                NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, 'NEIN') || '|' || NVL(prof.has_pf, 'NEIN') || '|' || NVL(pq.dop, '---') || '|' || SUBSTR(q.sql_text, 1, 30)
             FROM (
                 SELECT
                     sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text, exact_matching_signature, sql_profile,
@@ -207,11 +208,12 @@ def draw_dashboard(stdscr):
                 WHERE s.sql_id IS NOT NULL
                 GROUP BY s.sql_id
             ) pq ON q.sql_id = pq.sql_id
-            CROSS JOIN (
-                SELECT q.sql_id, DECODE(NVL(act.status, 'INA'), 'ACT', 2, 1) AS is_active_weight
-                FROM v$sql q
-                LEFT JOIN (SELECT DISTINCT sql_id, 'ACT' AS status FROM v$session WHERE status = 'ACTIVE' AND type != 'BACKGROUND' AND username NOT IN ('SYSTEM')) act ON q.sql_id = act.sql_id
-            ) wht WHERE q.sql_id = wht.sql_id
+            WHERE EXISTS (
+                SELECT 1 FROM v$session s2
+                WHERE (s2.sql_id = q.sql_id OR s2.prev_sql_id = q.sql_id)
+                  AND s2.type != 'BACKGROUND'
+                  AND s2.username NOT IN ('SYSTEM', 'DBSNMP')
+            )
             {order_clause}
             FETCH FIRST 20 ROWS ONLY;
             """
@@ -251,7 +253,7 @@ def draw_dashboard(stdscr):
 
                 if current_cursor_sql_id:
                     SQL_SESS_DETAIL = f"""
-                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machin[...]
+                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,15) || '|' || NVL(b.blocker_status, 'KEIN_BLOCKER')
                     FROM v$session s
                     LEFT JOIN (
                         SELECT DISTINCT blocking_session, 'BLOCKER' as blocker_status FROM v$session WHERE blocking_session IS NOT NULL
@@ -262,7 +264,7 @@ def draw_dashboard(stdscr):
                     cached_sess_output = run_sqlplus(SQL_SESS_DETAIL)
 
                     SQL_LIVE_EVENT = f"""
-                    SELECT DECODE(state, 'WAITING', event, 'ON CPU / PROCESSING') FROM v$session WHERE (sql_id = '{current_cursor_sql_id}' OR prev_sql_id = '{current_cursor_sql_id}') AND ROWNUM =[...]
+                    SELECT DECODE(state, 'WAITING', event, 'ON CPU / PROCESSING') FROM v$session WHERE (sql_id = '{current_cursor_sql_id}' OR prev_sql_id = '{current_cursor_sql_id}') AND ROWNUM = 1;
                     """
                     cached_live_waits = run_sqlplus(SQL_LIVE_EVENT)
 
@@ -306,7 +308,7 @@ def draw_dashboard(stdscr):
         if mode == "SQL_DETAIL" and selected_sql_id and (countdown <= 0 or refresh_frozen):
             safe_sql_id = validate_sql_id(selected_sql_id)
             if safe_sql_id:
-                SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC;"
+                SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC FETCH FIRST 5 ROWS ONLY;"
                 cached_waits_output = run_sqlplus(SQL_WAITS)
                 SQL_TEXT = f"SELECT sql_fulltext FROM v$sql WHERE sql_id = '{safe_sql_id}' AND ROWNUM = 1;"
                 cached_sql_text = run_sqlplus(SQL_TEXT)
