@@ -28,63 +28,6 @@ def safe_addstr(win, y, x, text, attr=0):
         pass
 
 
-def wrap_text_to_lines(text, width):
-    """Split text into display lines, wrapping long lines to width."""
-    if not text or width < 1:
-        return []
-    lines = []
-    for raw_line in text.replace("\r", "").split("\n"):
-        line = raw_line.strip()
-        if not line:
-            lines.append("")
-            continue
-        while len(line) > width:
-            lines.append(line[:width])
-            line = line[width:]
-        lines.append(line)
-    return lines if lines else [""]
-
-
-def draw_scroll_panel(stdscr, start_y, pane_height, pane_width, title, lines, scroll_top, focused, highlight_fn=None):
-    """Draw a titled scrollable panel; returns number of rows used."""
-    if pane_height < 3:
-        return 0
-
-    total = len(lines)
-    visible = pane_height - 2
-    if scroll_top < 0:
-        scroll_top = 0
-    if total > visible:
-        max_scroll = total - visible
-        if scroll_top > max_scroll:
-            scroll_top = max_scroll
-
-    if total == 0:
-        scroll_hint = " (leer)"
-    elif total <= visible:
-        scroll_hint = f" ({total} Zeilen)"
-    else:
-        scroll_hint = f" ({scroll_top + 1}-{scroll_top + visible}/{total})"
-
-    header_attr = curses.A_REVERSE | curses.A_BOLD if focused else curses.A_BOLD
-    header = f" {title}{scroll_hint} "
-    safe_addstr(stdscr, start_y, 0, header.ljust(pane_width)[: pane_width - 1], header_attr)
-    safe_addstr(stdscr, start_y + 1, 0, "-" * (pane_width - 1))
-
-    for row in range(visible):
-        line_idx = scroll_top + row
-        draw_y = start_y + 2 + row
-        if line_idx >= total:
-            break
-        line = lines[line_idx]
-        attr = curses.A_NORMAL
-        if highlight_fn:
-            attr = highlight_fn(line)
-        safe_addstr(stdscr, draw_y, 0, line[: pane_width - 1], attr)
-
-    return pane_height
-
-
 def run_sqlplus(sql_command):
     """Führt ein SQL-Kommando über SQL*Plus als SYSDBA via OS-Call aus."""
     cmd = ["sqlplus", "-S", "/", "as", "sysdba"]
@@ -140,12 +83,6 @@ def draw_dashboard(stdscr):
     cached_db_output = ""
     cached_waits_output = ""
     cached_xplan_output = ""
-    cached_sql_text = ""
-    sql_text_lines = []
-    xplan_lines = []
-    detail_focus = "SQL_TEXT"
-    sql_scroll_top = 0
-    xplan_scroll_top = 0
     cached_sess_output = ""
     cached_live_waits = ""
     cached_obj_stats = ""
@@ -208,7 +145,7 @@ def draw_dashboard(stdscr):
 
             SQL_TOP_20 = f"""
             SELECT
-                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, '---') || '|' || NVL(prof.has_pf, '---') || '|' || NVL(pq.dop, '---') || '|' || q.sql_text
+                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, 'NEIN') || '|' || NVL(prof.has_pf, 'NEIN') || '|' || NVL(pq.dop, '---') || '|' || SUBSTR(REPLACE(q.sql_text, CHR(10), ' '), 1, 60)
             FROM (
                 SELECT
                     sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text, exact_matching_signature, sql_profile,
@@ -296,7 +233,7 @@ def draw_dashboard(stdscr):
 
                 if current_cursor_sql_id:
                     SQL_SESS_DETAIL = f"""
-                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,20) || '|' || NVL(b.blocker_status, '---')
+                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,25) || '|' || NVL(b.blocker_status, 'NO_BLOCK')
                     FROM v$session s
                     LEFT JOIN (
                         SELECT DISTINCT blocking_session, 'BLOCKER' as blocker_status FROM v$session WHERE blocking_session IS NOT NULL
@@ -348,41 +285,16 @@ def draw_dashboard(stdscr):
                 if sub_mode == "OBJ_SCROLL":
                     last_obj_fetch = current_time
 
-        if mode == "SQL_DETAIL" and selected_sql_id and countdown <= 0 and not refresh_frozen:
+        if mode == "SQL_DETAIL" and selected_sql_id and (countdown <= 0 or refresh_frozen):
             safe_sql_id = validate_sql_id(selected_sql_id)
             if safe_sql_id:
-                SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC FETCH FIRST 5 ROWS ONLY;"
+                SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC;"
                 cached_waits_output = run_sqlplus(SQL_WAITS)
-                SQL_TEXT = f"SELECT sql_fulltext FROM v$sql WHERE sql_id = '{safe_sql_id}' AND ROWNUM = 1;"
-                cached_sql_text = run_sqlplus(SQL_TEXT)
                 SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'TYPICAL'));"
                 cached_xplan_output = run_sqlplus(SQL_XPLAN)
             else:
                 cached_waits_output = "FEHLER: Ungueltige SQL_ID"
-                cached_sql_text = ""
                 cached_xplan_output = ""
-
-            pane_width = max(40, max_x - 1)
-            if cached_sql_text and "FEHLER" not in cached_sql_text:
-                sql_text_lines = wrap_text_to_lines(cached_sql_text.strip(), pane_width)
-            else:
-                sql_text_lines = ["SQL-Text konnte nicht aus v$sql gelesen werden."]
-
-            if cached_xplan_output and "FEHLER" not in cached_xplan_output and cached_xplan_output.strip():
-                xplan_lines = [ln.rstrip() for ln in cached_xplan_output.split("\n") if ln.strip() or ln == ""]
-                if not xplan_lines:
-                    xplan_lines = ["Ausfuehrungsplan ist leer."]
-            else:
-                xplan_lines = ["Ausfuehrungsplan konnte nicht aus dem Cursor-Cache gelesen werden."]
-
-            sql_visible = max(1, (max_y - 14) // 2 - 2)
-            xplan_visible = max(1, max_y - 14 - sql_visible - 2)
-            sql_max_scroll = max(0, len(sql_text_lines) - sql_visible)
-            xplan_max_scroll = max(0, len(xplan_lines) - xplan_visible)
-            sql_scroll_top = min(sql_scroll_top, sql_max_scroll)
-            xplan_scroll_top = min(xplan_scroll_top, xplan_max_scroll)
-
-            countdown = refresh_interval
 
         sort_label = "ELAPSED TIME" if sort_column == "elapsed_time" else ("CPU-ZEIT" if sort_column == "cpu_time" else "BUFFER GETS")
         mode_label = "OBJ-SCROLL" if sub_mode == "OBJ_SCROLL" else "SQL-SELECT"
@@ -395,16 +307,19 @@ def draw_dashboard(stdscr):
 
         typing_status = f"Tippe Nr: {input_buffer}" if input_buffer else ""
 
-        if mode == "SQL_DETAIL":
-            detail_label = "SQL-TEXT" if detail_focus == "SQL_TEXT" else "XPLAN"
-            header_line = " ORAMON v6.0 DEEP DIVE | [s]/[<-] Zurueck  [o] Fokus SQL/Plan  [Pfeile] Scroll  [r] Refresh  [q] Exit"
-            status_line = f" Zeit: {time.strftime('%H:%M:%S')}  |  SQL_ID: {selected_sql_id:<13}  |  {refresh_status:<22} Fokus: {detail_label:<8}"
-        else:
-            header_line = " ORAMON v6.0 | [o] Modus  [Pfeile] Nav  [ENTER] XPlan  [e/c/b] Sort  [r] Refresh  [q] Exit"
-            status_line = f" Zeit: {time.strftime('%H:%M:%S')}  |  Sortierung: {sort_label:<12}  |  {refresh_status:<22} Fokus: {mode_label:<10} {typing_status}"
-
-        safe_addstr(stdscr, 0, 0, header_line, curses.A_REVERSE)
-        safe_addstr(stdscr, 1, 0, status_line)
+        safe_addstr(
+            stdscr,
+            0,
+            0,
+            " ORAMON v6.0 | [o] Modus  [Pfeile] Nav  [ENTER] XPlan  [e/c/b] Sort  [r] Refresh  [q] Exit",
+            curses.A_REVERSE,
+        )
+        safe_addstr(
+            stdscr,
+            1,
+            0,
+            f" Zeit: {time.strftime('%H:%M:%S')}  |  Sortierung: {sort_label:<12}  |  {refresh_status:<22} Fokus: {mode_label:<10} {typing_status}",
+        )
         safe_addstr(stdscr, 2, 0, "=" * line_width)
 
         if mode == "OVERVIEW":
@@ -575,59 +490,26 @@ def draw_dashboard(stdscr):
                             safe_addstr(stdscr, 36 + v_idx, 0, f"{o_owner:<15} | {o_name:<30} | {o_date:<17} | {o_type:<6}", obj_attr)
 
         elif mode == "SQL_DETAIL":
-            pane_width = max(40, max_x - 1)
-            safe_addstr(stdscr, 4, 0, "Top Wait Events (ASH):", curses.A_BOLD)
+            safe_addstr(stdscr, 4, 0, f" DEEP DIVE ANALYSE FÜR SQL_ID: {selected_sql_id}", curses.A_BOLD | curses.A_UNDERLINE)
+            safe_addstr(stdscr, 5, 0, "[s] / [Pfeil Links] Zurueck zur Uebersicht.")
+            safe_addstr(stdscr, 7, 0, "[A] Top Wait Events (ASH):", curses.A_BOLD)
             w_idx = 0
             for line in cached_waits_output.split("\n")[:3]:
                 cleaned_w = line.strip()
                 if "|" in cleaned_w:
                     event, samples = cleaned_w.split("|", 1)
-                    safe_addstr(
-                        stdscr,
-                        5 + w_idx,
-                        2,
-                        f"- {event.strip():<40} (Samples: {samples.strip()})",
-                        curses.A_NORMAL,
-                    )
+                    safe_addstr(stdscr, 8 + w_idx, 2, f"- Wartet auf: {event.strip():<35} (Samples: {samples.strip()})", curses.A_NORMAL)
                     w_idx += 1
-            if w_idx == 0:
-                safe_addstr(stdscr, 5, 2, "Keine ASH Wait Events fuer diese SQL_ID.", curses.A_DIM)
-
-            ash_rows = 6
-            available = max(10, max_y - ash_rows - 1)
-            sql_pane_height = max(5, available // 2)
-            xplan_pane_height = max(5, available - sql_pane_height)
-
-            def xplan_highlight(line):
-                if "TABLE ACCESS FULL" in line:
-                    return curses.color_pair(1) | curses.A_BOLD
-                return curses.A_NORMAL
-
-            sql_start = ash_rows
-            draw_scroll_panel(
-                stdscr,
-                sql_start,
-                sql_pane_height,
-                pane_width,
-                "SQL TEXT",
-                sql_text_lines,
-                sql_scroll_top,
-                detail_focus == "SQL_TEXT",
-            )
-
-            xplan_start = sql_start + sql_pane_height
-            if xplan_start < max_y - 3:
-                draw_scroll_panel(
-                    stdscr,
-                    xplan_start,
-                    xplan_pane_height,
-                    pane_width,
-                    "EXECUTION PLAN (DBMS_XPLAN)",
-                    xplan_lines,
-                    xplan_scroll_top,
-                    detail_focus == "XPLAN",
-                    highlight_fn=xplan_highlight,
-                )
+            safe_addstr(stdscr, 13, 0, "[B] Real Execution Plan (DBMS_XPLAN):", curses.A_BOLD)
+            if "FEHLER" in cached_waits_output or "FEHLER" in cached_xplan_output or not cached_xplan_output.strip():
+                safe_addstr(stdscr, 15, 2, "Ausführungsplan konnte nicht aus dem Cursor-Cache gelesen werden.", curses.A_DIM)
+            else:
+                plan_lines = min(15, max(0, max_y - 16))
+                for idx, plan_line in enumerate(cached_xplan_output.split("\n")[:plan_lines]):
+                    if "TABLE ACCESS FULL" in plan_line:
+                        safe_addstr(stdscr, 15 + idx, 2, plan_line[: max(0, max_x - 4)], curses.color_pair(1) | curses.A_BOLD)
+                    else:
+                        safe_addstr(stdscr, 15 + idx, 2, plan_line[: max(0, max_x - 4)])
 
         stdscr.refresh()
 
@@ -643,20 +525,11 @@ def draw_dashboard(stdscr):
                     if sub_mode == "OBJ_SCROLL":
                         last_obj_fetch = 0
                         footer_force_refresh = True
-                elif mode == "SQL_DETAIL":
-                    detail_focus = "XPLAN" if detail_focus == "SQL_TEXT" else "SQL_TEXT"
-                    last_user_activity = current_time
-                    refresh_frozen = True
 
             elif key == curses.KEY_DOWN:
                 last_user_activity = current_time
                 refresh_frozen = True
-                if mode == "SQL_DETAIL":
-                    if detail_focus == "SQL_TEXT":
-                        sql_scroll_top += 1
-                    else:
-                        xplan_scroll_top += 1
-                elif sub_mode == "SQL_SELECT":
+                if sub_mode == "SQL_SELECT":
                     if parsed_lines:
                         cursor_row = (cursor_row + 1) % len(parsed_lines)
                 elif obj_parsed_lines:
@@ -665,12 +538,7 @@ def draw_dashboard(stdscr):
             elif key == curses.KEY_UP:
                 last_user_activity = current_time
                 refresh_frozen = True
-                if mode == "SQL_DETAIL":
-                    if detail_focus == "SQL_TEXT":
-                        sql_scroll_top = max(0, sql_scroll_top - 1)
-                    else:
-                        xplan_scroll_top = max(0, xplan_scroll_top - 1)
-                elif sub_mode == "SQL_SELECT":
+                if sub_mode == "SQL_SELECT":
                     if parsed_lines:
                         cursor_row = (cursor_row - 1) % len(parsed_lines)
                 elif obj_parsed_lines:
@@ -682,17 +550,12 @@ def draw_dashboard(stdscr):
                     if candidate:
                         selected_sql_id = candidate
                         mode = "SQL_DETAIL"
-                        detail_focus = "SQL_TEXT"
-                        sql_scroll_top = 0
-                        xplan_scroll_top = 0
-                        countdown = -1  # Force immediate fetch
-                        refresh_frozen = False
+                        countdown = 0
 
             elif key in [ord("s"), curses.KEY_LEFT]:
                 if mode == "SQL_DETAIL":
                     mode = "OVERVIEW"
                     countdown = 0
-                    refresh_frozen = False
                 elif sub_mode == "OBJ_SCROLL":
                     sub_mode = "SQL_SELECT"
 
@@ -701,9 +564,6 @@ def draw_dashboard(stdscr):
                 countdown = 0
                 input_buffer = ""
                 footer_force_refresh = True
-                if mode == "SQL_DETAIL":
-                    sql_scroll_top = 0
-                    xplan_scroll_top = 0
             elif key == ord("e") and sub_mode == "SQL_SELECT":
                 sort_column = "elapsed_time"
                 countdown = 0
