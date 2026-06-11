@@ -28,6 +28,23 @@ def safe_addstr(win, y, x, text, attr=0):
         pass
 
 
+def wrap_text_to_lines(text, width):
+    """Split text into display lines, wrapping long lines to width."""
+    if not text or width < 1:
+        return []
+    lines = []
+    for raw_line in text.replace("\r", "").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        while len(line) > width:
+            lines.append(line[:width])
+            line = line[width:]
+        lines.append(line)
+    return lines if lines else [""]
+
+
 def run_sqlplus(sql_command):
     """Führt ein SQL-Kommando über SQL*Plus als SYSDBA via OS-Call aus."""
     cmd = ["sqlplus", "-S", "/", "as", "sysdba"]
@@ -83,6 +100,7 @@ def draw_dashboard(stdscr):
     cached_db_output = ""
     cached_waits_output = ""
     cached_xplan_output = ""
+    cached_sql_text = ""
     cached_sess_output = ""
     cached_live_waits = ""
     cached_obj_stats = ""
@@ -145,7 +163,7 @@ def draw_dashboard(stdscr):
 
             SQL_TOP_20 = f"""
             SELECT
-                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, 'NEIN') || '|' || NVL(prof.has_pf, 'NEIN') || '|' || NVL(pq.dop, '---') || '|' || SUBSTR(REPLACE(q.sql_text, CHR(10), ' '), 1, 60)
+                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec ||[...]
             FROM (
                 SELECT
                     sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text, exact_matching_signature, sql_profile,
@@ -233,7 +251,7 @@ def draw_dashboard(stdscr):
 
                 if current_cursor_sql_id:
                     SQL_SESS_DETAIL = f"""
-                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,25) || '|' || NVL(b.blocker_status, 'NO_BLOCK')
+                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machin[...]
                     FROM v$session s
                     LEFT JOIN (
                         SELECT DISTINCT blocking_session, 'BLOCKER' as blocker_status FROM v$session WHERE blocking_session IS NOT NULL
@@ -244,7 +262,7 @@ def draw_dashboard(stdscr):
                     cached_sess_output = run_sqlplus(SQL_SESS_DETAIL)
 
                     SQL_LIVE_EVENT = f"""
-                    SELECT DECODE(state, 'WAITING', event, 'ON CPU / PROCESSING') FROM v$session WHERE (sql_id = '{current_cursor_sql_id}' OR prev_sql_id = '{current_cursor_sql_id}') AND ROWNUM = 1;
+                    SELECT DECODE(state, 'WAITING', event, 'ON CPU / PROCESSING') FROM v$session WHERE (sql_id = '{current_cursor_sql_id}' OR prev_sql_id = '{current_cursor_sql_id}') AND ROWNUM =[...]
                     """
                     cached_live_waits = run_sqlplus(SQL_LIVE_EVENT)
 
@@ -290,10 +308,13 @@ def draw_dashboard(stdscr):
             if safe_sql_id:
                 SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC;"
                 cached_waits_output = run_sqlplus(SQL_WAITS)
+                SQL_TEXT = f"SELECT sql_fulltext FROM v$sql WHERE sql_id = '{safe_sql_id}' AND ROWNUM = 1;"
+                cached_sql_text = run_sqlplus(SQL_TEXT)
                 SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'TYPICAL'));"
                 cached_xplan_output = run_sqlplus(SQL_XPLAN)
             else:
                 cached_waits_output = "FEHLER: Ungueltige SQL_ID"
+                cached_sql_text = ""
                 cached_xplan_output = ""
 
         sort_label = "ELAPSED TIME" if sort_column == "elapsed_time" else ("CPU-ZEIT" if sort_column == "cpu_time" else "BUFFER GETS")
@@ -500,16 +521,33 @@ def draw_dashboard(stdscr):
                     event, samples = cleaned_w.split("|", 1)
                     safe_addstr(stdscr, 8 + w_idx, 2, f"- Wartet auf: {event.strip():<35} (Samples: {samples.strip()})", curses.A_NORMAL)
                     w_idx += 1
-            safe_addstr(stdscr, 13, 0, "[B] Real Execution Plan (DBMS_XPLAN):", curses.A_BOLD)
-            if "FEHLER" in cached_waits_output or "FEHLER" in cached_xplan_output or not cached_xplan_output.strip():
-                safe_addstr(stdscr, 15, 2, "Ausführungsplan konnte nicht aus dem Cursor-Cache gelesen werden.", curses.A_DIM)
+            
+            # SQL TEXT section - with proper wrapping for long SQL
+            safe_addstr(stdscr, 12, 0, "[C] SQL TEXT:", curses.A_BOLD)
+            sql_display_lines = max(3, max_y - 24)  # Reserve space for execution plan
+            pane_width = max(40, max_x - 2)
+            if cached_sql_text and "FEHLER" not in cached_sql_text:
+                sql_lines = wrap_text_to_lines(cached_sql_text.strip(), pane_width)
+                for idx, sql_line in enumerate(sql_lines[:sql_display_lines]):
+                    if 13 + idx >= max_y - 10:  # Stop before execution plan
+                        break
+                    safe_addstr(stdscr, 13 + idx, 2, sql_line[: max(0, max_x - 4)], curses.A_NORMAL)
             else:
-                plan_lines = min(15, max(0, max_y - 16))
-                for idx, plan_line in enumerate(cached_xplan_output.split("\n")[:plan_lines]):
-                    if "TABLE ACCESS FULL" in plan_line:
-                        safe_addstr(stdscr, 15 + idx, 2, plan_line[: max(0, max_x - 4)], curses.color_pair(1) | curses.A_BOLD)
-                    else:
-                        safe_addstr(stdscr, 15 + idx, 2, plan_line[: max(0, max_x - 4)])
+                safe_addstr(stdscr, 13, 2, "SQL-Text konnte nicht aus v$sql gelesen werden.", curses.A_DIM)
+            
+            # Execution Plan section - dynamic starting position based on SQL text height
+            xplan_start = 13 + sql_display_lines + 1
+            if xplan_start < max_y - 3:
+                safe_addstr(stdscr, xplan_start, 0, "[B] Real Execution Plan (DBMS_XPLAN):", curses.A_BOLD)
+                if "FEHLER" in cached_waits_output or "FEHLER" in cached_xplan_output or not cached_xplan_output.strip():
+                    safe_addstr(stdscr, xplan_start + 2, 2, "Ausführungsplan konnte nicht aus dem Cursor-Cache gelesen werden.", curses.A_DIM)
+                else:
+                    plan_lines = min(10, max(0, max_y - xplan_start - 4))
+                    for idx, plan_line in enumerate(cached_xplan_output.split("\n")[:plan_lines]):
+                        if "TABLE ACCESS FULL" in plan_line:
+                            safe_addstr(stdscr, xplan_start + 2 + idx, 2, plan_line[: max(0, max_x - 4)], curses.color_pair(1) | curses.A_BOLD)
+                        else:
+                            safe_addstr(stdscr, xplan_start + 2 + idx, 2, plan_line[: max(0, max_x - 4)])
 
         stdscr.refresh()
 
