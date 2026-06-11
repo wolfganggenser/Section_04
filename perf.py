@@ -45,8 +45,27 @@ def wrap_text_to_lines(text, width):
     return lines if lines else [""]
 
 
+def draw_scroll_panel(stdscr, start_y, pane_height, pane_width, title, lines, scroll_top, focused, highlight_fn=None):
+    """Draw a scrollable panel with title and content."""
+    safe_addstr(stdscr, start_y, 0, title, curses.A_BOLD | (curses.A_REVERSE if focused else 0))
+    safe_addstr(stdscr, start_y + 1, 0, "-" * pane_width)
+    
+    for i in range(pane_height):
+        line_idx = scroll_top + i
+        if line_idx >= len(lines):
+            break
+        
+        line = lines[line_idx]
+        if highlight_fn:
+            attr = highlight_fn(line)
+        else:
+            attr = curses.A_BOLD if line_idx == scroll_top else curses.A_NORMAL
+        
+        safe_addstr(stdscr, start_y + 2 + i, 0, line[:pane_width], attr)
+
+
 def run_sqlplus(sql_command):
-    """Führt ein SQL-Kommando über SQL*Plus als SYSDBA via OS-Call aus."""
+    """Run a SQL command via SQL*Plus as SYSDBA."""
     cmd = ["sqlplus", "-S", "/", "as", "sysdba"]
     formatted_sql = (
         "SET PAGESIZE 0;\n"
@@ -66,13 +85,10 @@ def run_sqlplus(sql_command):
             universal_newlines=True,
             env=current_env,
         )
-        stdout, stderr = proc.communicate(input=formatted_sql, timeout=10)
+        stdout, stderr = proc.communicate(input=formatted_sql)
         if stderr and stderr.strip():
             return f"FEHLER: {stderr.strip()}"
         return stdout.strip()
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return "FEHLER: SQL Timeout (>10s)"
     except Exception as e:
         return f"FEHLER: OS-Ausnahme {str(e)}"
 
@@ -158,21 +174,19 @@ def draw_dashboard(stdscr):
 
         if countdown <= 0 and not refresh_frozen:
             if sort_column == "cpu_time":
-                order_clause = "ORDER BY q.cpu_time_sec DESC"
+                order_clause = "ORDER BY is_active_weight DESC, q.cpu_time_sec DESC"
             elif sort_column == "buffer_gets":
-                order_clause = "ORDER BY q.buffer_gets_per_exec DESC"
+                order_clause = "ORDER BY is_active_weight DESC, q.buffer_gets_per_exec DESC"
             else:
-                order_clause = "ORDER BY q.elapsed_time_sec DESC"
+                order_clause = "ORDER BY is_active_weight DESC, q.elapsed_time_sec DESC"
 
-            # VEREINFACHTE SQL QUERY - nur v$sql, KEINE v$session JOINs
             SQL_TOP_20 = f"""
             SELECT
-                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || 
-                q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec || '|' || 
-                '---' || '|' || 'INA' || '|' || '1' || '|' || '---' || '|' || '---' || '|' || '---' || '|' || SUBSTR(q.sql_text, 1, 30)
+                q.sql_id || '|' || q.executions || '|' || q.cpu_time_sec || '|' || q.elapsed_time_sec || '|' || q.elap_per_exec || '|' || q.buffer_gets_per_exec || '|' || q.disk_reads_per_exec ||
+                NVL(p.fts, '---') || '|' || NVL(act.status, 'INA') || '|' || NVL(plans.plan_count, 1) || '|' || NVL(bl.has_bl, 'NEIN') || '|' || NVL(prof.has_pf, 'NEIN') || '|' || NVL(pq.dop, '---') || '|' || SUBSTR(q.sql_text, 1, 30)
             FROM (
                 SELECT
-                    sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text,
+                    sql_id, executions, elapsed_time, cpu_time, buffer_gets, disk_reads, sql_text, exact_matching_signature, sql_profile,
                     ROUND(cpu_time / 1000000, 2) as cpu_time_sec,
                     ROUND(elapsed_time / 1000000, 2) as elapsed_time_sec,
                     ROUND((elapsed_time / 1000000) / DECODE(executions, 0, 1, executions), 4) as elap_per_exec,
@@ -180,9 +194,33 @@ def draw_dashboard(stdscr):
                     ROUND(disk_reads / DECODE(executions, 0, 1, executions), 0) as disk_reads_per_exec
                 FROM v$sql
                 WHERE executions > 0
-                  AND sql_text NOT LIKE '%ORAMON%'
+                  AND sql_text NOT LIKE '%ORAMON_FILTER%'
                   AND sql_text NOT LIKE '%v$sql%'
+                  AND sql_text NOT LIKE '%v$session%'
+                  AND sql_text NOT LIKE '%v$active_session_history%'
             ) q
+            LEFT JOIN (
+                SELECT DISTINCT sql_id, 'FTS' AS fts FROM v$sql_plan WHERE operation = 'TABLE ACCESS' AND options = 'FULL'
+            ) p ON q.sql_id = p.sql_id
+            LEFT JOIN (
+                SELECT DISTINCT sql_id, 'ACT' AS status FROM v$session WHERE status = 'ACTIVE' AND type != 'BACKGROUND' AND username NOT IN ('SYSTEM', 'DBSNMP')
+            ) act ON q.sql_id = act.sql_id
+            LEFT JOIN (
+                SELECT sql_id, COUNT(DISTINCT plan_hash_value) AS plan_count FROM v$sql_plan GROUP BY sql_id
+            ) plans ON q.sql_id = plans.sql_id
+            LEFT JOIN (
+                SELECT signature, 'JA' AS has_bl FROM dba_sql_plan_baselines WHERE accepted = 'YES' AND enabled = 'YES'
+            ) bl ON q.exact_matching_signature = bl.signature
+            LEFT JOIN (
+                SELECT name, 'JA' AS has_pf FROM dba_sql_profiles WHERE status = 'ENABLED'
+            ) prof ON q.sql_profile = prof.name
+            LEFT JOIN (
+                SELECT s.sql_id, 'x' || COUNT(distinct px.sid) as dop
+                FROM v$px_session px
+                JOIN v$session s ON px.qcsid = s.sid
+                WHERE s.sql_id IS NOT NULL
+                GROUP BY s.sql_id
+            ) pq ON q.sql_id = pq.sql_id
             {order_clause}
             FETCH FIRST 20 ROWS ONLY;
             """
@@ -221,31 +259,54 @@ def draw_dashboard(stdscr):
                 footer_force_refresh = False
 
                 if current_cursor_sql_id:
-                    # SCHNELLE Session Query - nur wenn SQL_ID existiert
                     SQL_SESS_DETAIL = f"""
-                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,15) || '|' || 'KEIN_BLOCKER'
+                    SELECT s.sid || '|' || s.serial# || '|' || NVL(s.username, 'BACKGROUND') || '|' || SUBSTR(s.program,1,30) || '|' || NVL(SUBSTR(s.module,1,25), '---') || '|' || SUBSTR(s.machine,1,15) || '|' || NVL(b.blocker_status, 'KEIN_BLOCKER')
                     FROM v$session s
-                    WHERE s.sql_id = '{current_cursor_sql_id}'
-                    AND ROWNUM = 1;
+                    LEFT JOIN (
+                        SELECT DISTINCT blocking_session, 'BLOCKER' as blocker_status FROM v$session WHERE blocking_session IS NOT NULL
+                        ) b ON s.sid = b.blocking_session
+                    WHERE (s.sql_id = '{current_cursor_sql_id}' OR s.prev_sql_id = '{current_cursor_sql_id}')
+                      AND ROWNUM = 1;
                     """
                     cached_sess_output = run_sqlplus(SQL_SESS_DETAIL)
 
                     SQL_LIVE_EVENT = f"""
-                    SELECT DECODE(s.state, 'WAITING', s.event, 'ON CPU / PROCESSING') 
-                    FROM v$session s 
-                    WHERE s.sql_id = '{current_cursor_sql_id}' 
-                    AND ROWNUM = 1;
+                    SELECT DECODE(state, 'WAITING', event, 'ON CPU / PROCESSING') FROM v$session WHERE (sql_id = '{current_cursor_sql_id}' OR prev_sql_id = '{current_cursor_sql_id}') AND ROWNUM = 1;
                     """
                     cached_live_waits = run_sqlplus(SQL_LIVE_EVENT)
 
-                    # Optional: Object Stats (kann auch leer bleiben wenn zu langsam)
-                    cached_obj_stats = ""
+                    SQL_OBJ_STATS = f"""
+                    SELECT object_owner || '|' || object_name || '|' || TO_CHAR(last_analyzed, 'DD.MM.YYYY HH24:MI') || '|' || object_type
+                    FROM (
+                        SELECT p.object_owner, p.object_name, t.last_analyzed, 'TABLE' as object_type
+                        FROM v$sql_plan p
+                        JOIN dba_tables t ON p.object_owner = t.owner AND p.object_name = t.table_name
+                        WHERE p.sql_id = '{current_cursor_sql_id}' AND p.object_name IS NOT NULL
+                        UNION ALL
+                        SELECT p.object_owner, p.object_name, i.last_analyzed, 'INDEX' as object_type
+                        FROM v$sql_plan p
+                        JOIN dba_indexes i ON p.object_owner = i.owner AND p.object_name = i.index_name
+                        WHERE p.sql_id = '{current_cursor_sql_id}' AND p.object_name IS NOT NULL
+                    ) WHERE ROWNUM <= 30;
+                    """
+                    cached_obj_stats = run_sqlplus(SQL_OBJ_STATS)
                 else:
                     cached_sess_output = ""
                     cached_live_waits = ""
                     cached_obj_stats = ""
 
                 obj_parsed_lines = []
+                if cached_obj_stats and "FEHLER" not in cached_obj_stats and cached_obj_stats.strip():
+                    for o_line in cached_obj_stats.split("\n"):
+                        if "|" in o_line:
+                            o_parts = o_line.split("|")
+                            if len(o_parts) >= 4:
+                                obj_parsed_lines.append([o.strip() for o in o_parts])
+
+                if obj_cursor_row >= len(obj_parsed_lines) and obj_parsed_lines:
+                    obj_cursor_row = len(obj_parsed_lines) - 1
+                    obj_scroll_top = max(0, obj_cursor_row - max_visible_objects + 1)
+
                 if refresh_frozen and sub_mode != "OBJ_SCROLL":
                     last_frozen_fetch = current_time
                 if sub_mode == "OBJ_SCROLL":
@@ -254,11 +315,12 @@ def draw_dashboard(stdscr):
         if mode == "SQL_DETAIL" and selected_sql_id and (countdown <= 0 or refresh_frozen):
             safe_sql_id = validate_sql_id(selected_sql_id)
             if safe_sql_id:
+                SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC;"
+                cached_waits_output = run_sqlplus(SQL_WAITS)
                 SQL_TEXT = f"SELECT sql_fulltext FROM v$sql WHERE sql_id = '{safe_sql_id}' AND ROWNUM = 1;"
                 cached_sql_text = run_sqlplus(SQL_TEXT)
                 SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'TYPICAL'));"
                 cached_xplan_output = run_sqlplus(SQL_XPLAN)
-                cached_waits_output = ""
             else:
                 cached_waits_output = "FEHLER: Ungueltige SQL_ID"
                 cached_sql_text = ""
@@ -403,48 +465,90 @@ def draw_dashboard(stdscr):
                 safe_addstr(stdscr, 28, 0, f"Effizienz:  Durchschnitt: {ela_exe:<6}s | Logische Reads: {gets:<10} | Physische Reads: {reads}")
 
                 if cached_sess_output and "FEHLER" not in cached_sess_output and "|" in cached_sess_output:
-                    try:
-                        sid, serial, username, program, module, machine, blocker = [s.strip() for s in cached_sess_output.split("|", 6)]
-                        safe_addstr(
-                            stdscr,
-                            29,
-                            0,
-                            f"Session:    SID/Serial: {sid},{serial:<6} User: {username:<10} Module: {module[:15]:<15} Machine: {machine[:15]:<15} Prog: {program[:15]}",
-                        )
-                    except:
-                        safe_addstr(stdscr, 29, 0, "Session:    Keine aktive Zuordnung in v$session.", curses.A_DIM)
+                    sid, serial, username, program, module, machine, blocker = [s.strip() for s in cached_sess_output.split("|")]
+                    safe_addstr(
+                        stdscr,
+                        29,
+                        0,
+                        f"Session:    SID/Serial: {sid},{serial:<6} User: {username:<10} Module: {module[:15]:<15} Machine: {machine[:15]:<15} Prog: {program[:15]}",
+                    )
+                    safe_addstr(stdscr, 30, 0, "BLOCKER:    ")
+                    if blocker == "BLOCKER":
+                        safe_addstr(stdscr, 30, 11, "!!! DIESE SESSION BLOCKIERT AKTIV ANDERE SITZUNGEN !!!", curses.color_pair(1) | curses.A_BOLD)
+                    else:
+                        safe_addstr(stdscr, 30, 11, "KEIN BLOCKER - Session blockiert keine anderen Prozesse.", curses.color_pair(2) | curses.A_BOLD)
+                    safe_addstr(stdscr, 31, 0, "LIVE WAITS: ")
+                    if cached_live_waits and "FEHLER" not in cached_live_waits and cached_live_waits.strip():
+                        safe_addstr(stdscr, 31, 11, cached_live_waits.strip(), curses.A_BOLD)
+                    else:
+                        safe_addstr(stdscr, 31, 11, "ON CPU / PROCESSING", curses.color_pair(2) | curses.A_BOLD)
+                    safe_addstr(stdscr, 32, 0, f"SQL-Text:  {full_text[: max(0, max_x - 12)]}")
                 else:
-                    safe_addstr(stdscr, 29, 0, "Session:    Keine aktive Zuordnung in v$session.", curses.A_DIM)
+                    safe_addstr(stdscr, 29, 0, "Session:    Keine aktive Zuordnung in v$session (Mikropause oder Statement beendet).", curses.A_DIM)
+                    safe_addstr(stdscr, 30, 0, f"SQL-Text:  {full_text[: max(0, max_x - 12)]}")
 
-                safe_addstr(stdscr, 30, 0, "LIVE WAITS: ")
-                if cached_live_waits and "FEHLER" not in cached_live_waits and cached_live_waits.strip():
-                    safe_addstr(stdscr, 30, 11, cached_live_waits.strip(), curses.A_BOLD)
-                else:
-                    safe_addstr(stdscr, 30, 11, "ON CPU / PROCESSING", curses.color_pair(2) | curses.A_BOLD)
-                safe_addstr(stdscr, 31, 0, f"SQL-Text:  {full_text[: max(0, max_x - 12)]}")
+                if max_y > 34:
+                    scroll_indicator = (
+                        f" (Scroll aktiv: Zeile {obj_cursor_row + 1}/{len(obj_parsed_lines)})"
+                        if sub_mode == "OBJ_SCROLL"
+                        else " [o] Druecken zum Scrollen"
+                    )
+                    safe_addstr(
+                        stdscr,
+                        34,
+                        0,
+                        f"{'OBJECT OWNER':<15} | {'OBJECT NAME':<30} | {'LAST ANALYZED':<17} | {'TYPE':<6} |{scroll_indicator:<25}",
+                        curses.A_BOLD | curses.A_REVERSE,
+                    )
+                    safe_addstr(stdscr, 35, 0, "-" * min(95, line_width))
+
+                    if not obj_parsed_lines:
+                        safe_addstr(stdscr, 36, 2, "Keine Tabellen/Index-Objektzuordnungen im aktuellen Cursor-Cache gefunden.", curses.A_DIM)
+                    else:
+                        if obj_cursor_row < obj_scroll_top:
+                            obj_scroll_top = obj_cursor_row
+                        elif obj_cursor_row >= obj_scroll_top + max_visible_objects:
+                            obj_scroll_top = obj_cursor_row - max_visible_objects + 1
+
+                        for v_idx in range(max_visible_objects):
+                            curr_obj_idx = obj_scroll_top + v_idx
+                            if curr_obj_idx >= len(obj_parsed_lines) or 36 + v_idx >= max_y:
+                                break
+
+                            o_owner, o_name, o_date, o_type = obj_parsed_lines[curr_obj_idx]
+                            obj_attr = curses.A_REVERSE | curses.A_BOLD if sub_mode == "OBJ_SCROLL" and curr_obj_idx == obj_cursor_row else curses.A_NORMAL
+                            safe_addstr(stdscr, 36 + v_idx, 0, f"{o_owner:<15} | {o_name:<30} | {o_date:<17} | {o_type:<6}", obj_attr)
 
         elif mode == "SQL_DETAIL":
             safe_addstr(stdscr, 4, 0, f" DEEP DIVE ANALYSE FÜR SQL_ID: {selected_sql_id}", curses.A_BOLD | curses.A_UNDERLINE)
             safe_addstr(stdscr, 5, 0, "[s] / [Pfeil Links] Zurueck zur Uebersicht.")
+            safe_addstr(stdscr, 7, 0, "[A] Top Wait Events (ASH):", curses.A_BOLD)
+            w_idx = 0
+            for line in cached_waits_output.split("\n")[:3]:
+                cleaned_w = line.strip()
+                if "|" in cleaned_w:
+                    event, samples = cleaned_w.split("|", 1)
+                    safe_addstr(stdscr, 8 + w_idx, 2, f"- Wartet auf: {event.strip():<35} (Samples: {samples.strip()})", curses.A_NORMAL)
+                    w_idx += 1
             
             # SQL TEXT section - with proper wrapping for long SQL
-            safe_addstr(stdscr, 7, 0, "[C] SQL TEXT:", curses.A_BOLD)
-            sql_display_lines = max(5, max_y - 20)  # Reserve space for execution plan
+            safe_addstr(stdscr, 12, 0, "[C] SQL TEXT:", curses.A_BOLD)
+            sql_display_lines = max(3, max_y - 24)  # Reserve space for execution plan
             pane_width = max(40, max_x - 2)
             if cached_sql_text and "FEHLER" not in cached_sql_text:
                 sql_lines = wrap_text_to_lines(cached_sql_text.strip(), pane_width)
                 for idx, sql_line in enumerate(sql_lines[:sql_display_lines]):
-                    if 8 + idx >= max_y - 10:  # Stop before execution plan
+                    if 13 + idx >= max_y - 10:  # Stop before execution plan
                         break
-                    safe_addstr(stdscr, 8 + idx, 2, sql_line[: max(0, max_x - 4)], curses.A_NORMAL)
+                    safe_addstr(stdscr, 13 + idx, 2, sql_line[: max(0, max_x - 4)], curses.A_NORMAL)
             else:
-                safe_addstr(stdscr, 8, 2, "SQL-Text konnte nicht aus v$sql gelesen werden.", curses.A_DIM)
+                safe_addstr(stdscr, 13, 2, "SQL-Text konnte nicht aus v$sql gelesen werden.", curses.A_DIM)
             
             # Execution Plan section - dynamic starting position based on SQL text height
-            xplan_start = 8 + sql_display_lines + 1
+            xplan_start = 13 + sql_display_lines + 1
             if xplan_start < max_y - 3:
                 safe_addstr(stdscr, xplan_start, 0, "[B] Real Execution Plan (DBMS_XPLAN):", curses.A_BOLD)
-                if "FEHLER" in cached_xplan_output or not cached_xplan_output.strip():
+                if "FEHLER" in cached_waits_output or "FEHLER" in cached_xplan_output or not cached_xplan_output.strip():
                     safe_addstr(stdscr, xplan_start + 2, 2, "Ausführungsplan konnte nicht aus dem Cursor-Cache gelesen werden.", curses.A_DIM)
                 else:
                     plan_lines = min(10, max(0, max_y - xplan_start - 4))
@@ -462,9 +566,12 @@ def draw_dashboard(stdscr):
                 break
 
             elif key == ord("o"):
-                if mode == "OVERVIEW":
+                if mode == "OVERVIEW" and obj_parsed_lines:
                     sub_mode = "OBJ_SCROLL" if sub_mode == "SQL_SELECT" else "SQL_SELECT"
                     last_user_activity = current_time
+                    if sub_mode == "OBJ_SCROLL":
+                        last_obj_fetch = 0
+                        footer_force_refresh = True
 
             elif key == curses.KEY_DOWN:
                 last_user_activity = current_time
@@ -472,6 +579,8 @@ def draw_dashboard(stdscr):
                 if sub_mode == "SQL_SELECT":
                     if parsed_lines:
                         cursor_row = (cursor_row + 1) % len(parsed_lines)
+                elif obj_parsed_lines:
+                    obj_cursor_row = (obj_cursor_row + 1) % len(obj_parsed_lines)
 
             elif key == curses.KEY_UP:
                 last_user_activity = current_time
@@ -479,6 +588,8 @@ def draw_dashboard(stdscr):
                 if sub_mode == "SQL_SELECT":
                     if parsed_lines:
                         cursor_row = (cursor_row - 1) % len(parsed_lines)
+                elif obj_parsed_lines:
+                    obj_cursor_row = (obj_cursor_row - 1) % len(obj_parsed_lines)
 
             elif key in [curses.KEY_ENTER, 10, 13]:
                 if mode == "OVERVIEW" and top_sql_list and sub_mode == "SQL_SELECT":
@@ -492,12 +603,14 @@ def draw_dashboard(stdscr):
                 if mode == "SQL_DETAIL":
                     mode = "OVERVIEW"
                     countdown = 0
+                elif sub_mode == "OBJ_SCROLL":
+                    sub_mode = "SQL_SELECT"
 
             elif key == ord("r"):
                 refresh_frozen = False
                 countdown = 0
                 input_buffer = ""
-
+                footer_force_refresh = True
             elif key == ord("e") and sub_mode == "SQL_SELECT":
                 sort_column = "elapsed_time"
                 countdown = 0
