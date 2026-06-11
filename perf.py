@@ -290,7 +290,9 @@ def draw_dashboard(stdscr):
             if safe_sql_id:
                 SQL_WAITS = f"SELECT event || '|' || COUNT(*) FROM v$active_session_history WHERE sql_id = '{safe_sql_id}' AND event IS NOT NULL GROUP BY event ORDER BY COUNT(*) DESC;"
                 cached_waits_output = run_sqlplus(SQL_WAITS)
-                SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'TYPICAL'));"
+                SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'BASIC')) WHERE SUBSTR(plan_table_output, 1, 1) IN ('|', '-');"
+                #SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'BASIC'));"
+                #SQL_XPLAN = f"SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('{safe_sql_id}', NULL, 'TYPICAL'));"
                 cached_xplan_output = run_sqlplus(SQL_XPLAN)
             else:
                 cached_waits_output = "FEHLER: Ungueltige SQL_ID"
